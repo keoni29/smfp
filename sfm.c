@@ -10,6 +10,8 @@ static uint8_t Peek(uint8_t *p, uint32_t *bytesleft);	/**< Peek single byte data
 static uint8_t SkipData(uint8_t **p, uint32_t *bytesleft, uint32_t skip);	/**< Skip over several fields */
 static char *Terminate(char* dst, char *src, uint32_t len); /**< Terminate a character string of specified length. */
 
+static float mpb = 500000, tpb, tick;
+
 /** Read and verify header of a Standard MIDI File
  *  Returns -1 on failure, 0 on success. */
 int SFM_ReadHeader(FILE *in ,struct SFM_header* header)
@@ -24,6 +26,8 @@ int SFM_ReadHeader(FILE *in ,struct SFM_header* header)
 	ReverseInt16(&header->format);
 	ReverseInt16(&header->n);
 	ReverseInt16(&header->division);
+
+	tpb = header->division;
 
 	return 0;
 }
@@ -50,15 +54,23 @@ uint8_t *SFM_ReadChunk(FILE *in, struct SFM_chunk* chunk)
 
 int SFM_ParseChunk(FILE *out, struct SFM_chunk* chunk, uint8_t *data)
 {
-	uint32_t time, length, left;
-	uint8_t event, type, key, vel;
+	float time;
+	uint32_t dt, length, left;
+	uint8_t event, type, p1, p2;
 	char str[100];
 
 	left = chunk->length;
 
 	while (left)
 	{
-		time = VData(&data, &left);
+		/* Calculate time offset */
+		if (Peek(data, &left))
+		{
+			p1 = p2; /* Todo remove this. Variable length field! */
+		}
+
+		dt = VData(&data, &left);
+		time += dt * tick / 1000000;
 
 		if (!(Peek(data, &left) & 0x80))
 		{
@@ -69,7 +81,7 @@ int SFM_ParseChunk(FILE *out, struct SFM_chunk* chunk, uint8_t *data)
 			event = Data(&data, &left);
 		}
 
-		fprintf(out, "dt %u, ", time);
+		fprintf(out, "%.1f s, ", time);
 
 		switch (event)
 		{
@@ -80,64 +92,76 @@ int SFM_ParseChunk(FILE *out, struct SFM_chunk* chunk, uint8_t *data)
 			{
 				++length;
 			}
-			fprintf(out, "SYEX, len %u\r\n", length);
+			fprintf(out, "SYEX 0x%02x[%u]\r\n", event, length);
 			break;
 
 		case 0xFF :
 			type = Data(&data, &left);
 			length = VData(&data, &left);
-			fprintf(out, "META, type %u, len %u, \"%s\"\r\n", type, length, Terminate(str, (char *)data, length));
-			SkipData(&data, &left, length);
+			fprintf(out, "META 0x%02x[%u] \"%s\"\r\n", type, length, Terminate(str, (char *)data, length));
+			if (type == 0x51 && length == 3)
+			{
+				mpb = 0;
+				mpb = (Data(&data, &left) << 16) | (Data(&data, &left) << 8) | (Data(&data, &left) << 0);
+				tick = mpb / tpb;
+			}
+			else
+			{
+				SkipData(&data, &left, length);
+			}
 			break;
 
 		default :
-			length = 0;
-
-			fprintf(out, "MIDI event %u, len %u : ", event, length);
+			fprintf(out, "MIDI 0x%02x[], : ", event);
 
 			switch (event & 0xF0)
 			{
 			case 0xF0:
-				fprintf(out, "Unhandled midi event %x.\r\n", event);
+				fprintf(out, "Unhandled midi event 0x%02x.\r\n", event);
 				return -1;
 				break;
 			case 0x80:
-				key = Data(&data, &left);
-				vel = Data(&data, &left);
-				fprintf(out, "Note Off %u, %u\r\n", key, vel);
+				p1 = Data(&data, &left);
+				p2 = Data(&data, &left);
+				fprintf(out, "Note Off %u, %u\r\n", p1, p2);
 				break;
 			case 0x90:
-				key = Data(&data, &left);
-				vel = Data(&data, &left);
-				fprintf(out, "Note On %u, %u\r\n", key, vel);
+				p1 = Data(&data, &left);
+				p2 = Data(&data, &left);
+				fprintf(out, "Note On %u, %u\r\n", p1, p2);
 				break;
 			case 0xA0:
-				key = Data(&data, &left);
-				vel = Data(&data, &left);
-				fprintf(out, "Key pressure %u, %u\r\n", key, vel);
+				p1 = Data(&data, &left);
+				p2 = Data(&data, &left);
+				fprintf(out, "p1 pressure %u, %u\r\n", p1, p2);
 				break;
 			case 0xB0:
-				key = Data(&data, &left);
-				vel = Data(&data, &left);
-				fprintf(out, "Control change %u, %u\r\n", key, vel);
+				p1 = Data(&data, &left);
+				p2 = Data(&data, &left);
+				fprintf(out, "Control change %u, %u\r\n", p1, p2);
 				break;
 			case 0xC0:
-				key = Data(&data, &left);
-				fprintf(out, "Program change %u\r\n", key);
+				p1 = Data(&data, &left);
+				fprintf(out, "Program change %u\r\n", p1);
 				break;
 			case 0xD0:
-				vel = Data(&data, &left);
-				fprintf(out, "Channel pressure %u\r\n", vel);
+				p1 = Data(&data, &left);
+				fprintf(out, "Channel pressure %u\r\n", p1);
 				break;
 			case 0xE0:
-				key = Data(&data, &left);
-				vel = Data(&data, &left);
-				fprintf(out, "Pitch wheel change %u, %u\r\n", key, vel);
+				p1 = Data(&data, &left);
+				p2 = Data(&data, &left);
+				fprintf(out, "Pitch wheel change %u, %u\r\n", p1, p2);
 				break;
 			}
 
 			break;
 		}
+	}
+
+	if (!(event == 0xFF && type == 0x2F))
+	{
+		fprintf(out, "Notice: Last message was not META 0x2F (End of track)\r\n");
 	}
 	return 0;
 }
@@ -170,7 +194,7 @@ static uint32_t VData(uint8_t **p, uint32_t *bytesleft)
 	{
 		for (i = 0; i < 4; i++)
 		{
-			data += (**p & 0x7F) << (i * 7);
+			data = (data << 7) +  (**p & 0x7F);
 
 			if (!(**p & 0x80))
 			{
